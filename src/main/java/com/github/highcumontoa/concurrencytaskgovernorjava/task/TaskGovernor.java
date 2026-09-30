@@ -26,6 +26,13 @@ public interface TaskGovernor {
      */
     Optional<TaskRecord> cancel(String id);
 
+    /**
+     * Read-only occupancy snapshot of the whole service: running/queued/
+     * in-flight totals and per-source breakdown. Never triggers execution or
+     * changes task state.
+     */
+    GovernorSnapshot snapshot();
+
     /** Gracefully stop accepting work and release resources. */
     void shutdown();
 }
