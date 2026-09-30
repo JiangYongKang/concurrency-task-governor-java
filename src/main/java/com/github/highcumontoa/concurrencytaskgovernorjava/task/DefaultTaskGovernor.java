@@ -1,11 +1,11 @@
 package com.github.highcumontoa.concurrencytaskgovernorjava.task;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -14,6 +14,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -28,8 +30,18 @@ import org.springframework.stereotype.Component;
  * permits bounds total in-flight (queued + running) tasks; a fixed worker pool of
  * {@code maxConcurrency} threads bounds actual parallelism; a per-source semaphore
  * of {@code perSourceMaxInFlight} permits guarantees fair sharing between callers.
- * Permits are released exactly once per task, when the task reaches a terminal
- * state (guarded by {@link #releasedResources}).
+ *
+ * <p>Convergence model: timeout, cancel and completion race through
+ * {@link TaskRecord#decideTerminal}; exactly one winner exists. The winner first
+ * makes the handler stop (it never starts, returns, or is interrupted and
+ * returns), then releases the global and per-source permits, and only then
+ * publishes the terminal status. Consequently a task observed in a terminal
+ * state has already fully ended and given every resource back.
+ *
+ * <p>Occupancy counters are moved under {@link #snapshotLock} together with the
+ * RUNNING/terminal status publication, so {@link #snapshot()} is internally
+ * consistent and always reconciles exactly with the outstanding semaphore
+ * permits (in-flight = acquired, not yet released).
  */
 @Component
 @EnableConfigurationProperties(TaskGovernorProperties.class)
@@ -42,13 +54,19 @@ public class DefaultTaskGovernor implements TaskGovernor {
 
     private final Map<String, TaskRecord> tasksById = new ConcurrentHashMap<>();
     private final Map<String, String> idByIdempotencyKey = new ConcurrentHashMap<>();
-    private final Map<String, Future<?>> runningFutures = new ConcurrentHashMap<>();
     private final Map<String, Semaphore> sourcePermits = new ConcurrentHashMap<>();
-    private final Set<String> releasedResources = ConcurrentHashMap.newKeySet();
 
     private final Semaphore globalPermits;
     private final ExecutorService workers;
     private final ScheduledExecutorService scheduler;
+
+    // Occupancy counters; every mutation happens while holding snapshotLock and,
+    // when a task status is involved, the task record's monitor (lock order:
+    // snapshotLock -> TaskRecord).
+    private final Lock snapshotLock = new ReentrantLock();
+    private int runningCount;
+    private int queuedCount;
+    private final Map<String, SourceCounters> sourceCounters = new HashMap<>();
 
     public DefaultTaskGovernor(TaskGovernorProperties properties, List<TaskHandler> handlers) {
         this.properties = properties;
@@ -114,17 +132,21 @@ public class DefaultTaskGovernor implements TaskGovernor {
             return SubmissionResult.duplicate(raced != null ? raced : record);
         }
         tasksById.put(record.getId(), record);
+
+        snapshotLock.lock();
+        try {
+            queuedCount++;
+            sourceCounters.computeIfAbsent(request.source(), key -> new SourceCounters()).queued++;
+        } finally {
+            snapshotLock.unlock();
+        }
         log.info("task {} accepted: source={} type={} deadline={}",
                 record.getId(), record.getSource(), record.getType(), record.getDeadline());
 
         scheduler.schedule(() -> onDeadline(record.getId()),
                 timeoutMs, TimeUnit.MILLISECONDS);
-        Future<?> future = workers.submit(() -> execute(record));
-        runningFutures.put(record.getId(), future);
-        if (record.getStatus().isTerminal()) {
-            // Terminal transition (timeout/cancel) raced with future registration.
-            future.cancel(true);
-        }
+        Future<?> future = workers.submit(() -> runTask(record));
+        record.bindFuture(future);
         return SubmissionResult.accepted(record);
     }
 
@@ -134,19 +156,41 @@ public class DefaultTaskGovernor implements TaskGovernor {
     }
 
     @Override
+    public List<TaskEvent> history(String id) {
+        TaskRecord record = tasksById.get(id);
+        return record == null ? List.of() : record.historySnapshot();
+    }
+
+    @Override
+    public GovernorSnapshot snapshot() {
+        snapshotLock.lock();
+        try {
+            List<SourceOccupancy> perSource = new ArrayList<>();
+            for (Map.Entry<String, SourceCounters> entry : sourceCounters.entrySet()) {
+                SourceCounters counters = entry.getValue();
+                int total = counters.running + counters.queued;
+                if (total > 0) {
+                    perSource.add(new SourceOccupancy(entry.getKey(), counters.running, counters.queued, total));
+                }
+            }
+            perSource.sort((a, b) -> a.source().compareTo(b.source()));
+            return new GovernorSnapshot(runningCount, queuedCount,
+                    runningCount + queuedCount, List.copyOf(perSource));
+        } finally {
+            snapshotLock.unlock();
+        }
+    }
+
+    @Override
     public Optional<TaskRecord> cancel(String id) {
         TaskRecord record = tasksById.get(id);
         if (record == null) {
             return Optional.empty();
         }
-        if (record.transitionTo(TaskStatus.CANCELLED)) {
-            record.setFailureReason(FailureReason.CANCELLED);
-            log.info("task {} cancelled by caller (was not terminal)", id);
-            Future<?> future = runningFutures.get(id);
-            if (future != null) {
-                future.cancel(true);
-            }
-            releaseResources(record);
+        if (record.decideTerminal(TaskStatus.CANCELLED, FailureReason.CANCELLED)) {
+            log.info("task {} cancel won terminal decision; interrupting/dismissing worker", id);
+            record.interruptIfBound();
+            settle(record, TaskStatus.CANCELLED, FailureReason.CANCELLED, null, record.isStarted());
         }
         return Optional.of(record);
     }
@@ -156,72 +200,139 @@ public class DefaultTaskGovernor implements TaskGovernor {
         if (record == null) {
             return;
         }
-        if (record.transitionTo(TaskStatus.TIMED_OUT)) {
-            record.setFailureReason(FailureReason.TIMEOUT);
-            log.info("task {} timed out (deadline {} reached)", taskId, record.getDeadline());
-            Future<?> future = runningFutures.get(taskId);
-            if (future != null) {
-                future.cancel(true);
-            }
-            releaseResources(record);
+        if (record.decideTerminal(TaskStatus.TIMED_OUT, FailureReason.TIMEOUT)) {
+            log.info("task {} deadline won terminal decision (deadline {}); interrupting/dismissing worker",
+                    taskId, record.getDeadline());
+            record.interruptIfBound();
+            settle(record, TaskStatus.TIMED_OUT, FailureReason.TIMEOUT, null, record.isStarted());
         }
     }
 
-    private void execute(TaskRecord record) {
+    /** Worker-pool runnable: claims execution, invokes the handler, converges on finish. */
+    private void runTask(TaskRecord record) {
         String taskId = record.getId();
-        if (!record.transitionTo(TaskStatus.RUNNING)) {
-            // Cancelled or timed out while still queued; never execute.
-            log.info("task {} skipped execution, already terminal: {}", taskId, record.getStatus());
-            releaseResources(record);
+        boolean claimed;
+        snapshotLock.lock();
+        try {
+            synchronized (record) {
+                if (record.isDecided() || record.isStarted()) {
+                    claimed = false;
+                } else {
+                    record.markRunning();
+                    claimed = true;
+                    queuedCount--;
+                    runningCount++;
+                    SourceCounters counters = sourceCounters.get(record.getSource());
+                    counters.queued--;
+                    counters.running++;
+                }
+            }
+        } finally {
+            snapshotLock.unlock();
+        }
+        if (!claimed) {
+            // A terminal decision (cancel/timeout while queued) won first; the
+            // handler must never execute.
+            log.info("task {} skipped execution, terminal decision already made: {}",
+                    taskId, record.getStatus());
             return;
         }
+
         log.info("task {} running", taskId);
         try {
             TaskHandler handler = handlersByType.get(record.getType());
             if (handler == null) {
-                if (record.transitionTo(TaskStatus.FAILED)) {
-                    record.setFailureReason(FailureReason.UNSUPPORTED_TYPE);
-                }
+                workerConverge(record, TaskStatus.FAILED, FailureReason.UNSUPPORTED_TYPE, null);
                 return;
             }
-            String result = handler.execute(record.getPayload());
-            if (record.transitionTo(TaskStatus.SUCCEEDED)) {
-                record.setResult(result);
-                log.info("task {} succeeded", taskId);
-            } else {
-                log.info("task {} finished but lost race to terminal state {}", taskId, record.getStatus());
+            String handlerResult;
+            try {
+                handlerResult = handler.execute(record.getPayload());
+            } catch (InterruptedException interrupted) {
+                // Interrupt normally follows an external timeout/cancel decision;
+                // the fallback only covers an interrupt with no decision present.
+                Thread.currentThread().interrupt();
+                log.info("task {} interrupted with no prior decision; converging to CANCELLED", taskId);
+                workerConverge(record, TaskStatus.CANCELLED, FailureReason.CANCELLED, null);
+                return;
+            } catch (Throwable throwable) {
+                log.warn("task {} handler threw: {}", taskId, throwable.getClass().getSimpleName());
+                workerConverge(record, TaskStatus.FAILED, FailureReason.HANDLER_ERROR, null);
+                return;
             }
-        } catch (InterruptedException interrupted) {
-            // Interrupt always follows a terminal transition (cancel/timeout);
-            // this fallback only covers an unlikely ordering race.
-            Thread.currentThread().interrupt();
-            if (record.transitionTo(TaskStatus.CANCELLED)) {
-                record.setFailureReason(FailureReason.CANCELLED);
-            }
-            log.info("task {} interrupted, final state {}", taskId, record.getStatus());
-        } catch (Throwable throwable) {
-            if (record.transitionTo(TaskStatus.FAILED)) {
-                record.setFailureReason(FailureReason.HANDLER_ERROR);
-                log.warn("task {} failed: {}", taskId, throwable.getClass().getSimpleName());
-            } else {
-                log.info("task {} threw after terminal state {}: {}",
-                        taskId, record.getStatus(), throwable.getClass().getSimpleName());
-            }
+            workerConverge(record, TaskStatus.SUCCEEDED, FailureReason.NONE, handlerResult);
         } finally {
-            runningFutures.remove(taskId);
-            releaseResources(record);
+            // Signals external decision winners (awaiting in settle()) that the
+            // interrupted handler has fully returned. The interrupt flag that
+            // Future.cancel(true) leaves even when the worker made the decision
+            // must not bleed into the next task run by this pooled thread.
+            Thread.interrupted();
+            record.signalWorkerDone();
         }
     }
 
-    /** Releases capacity permits exactly once per task. */
-    private void releaseResources(TaskRecord record) {
-        if (releasedResources.add(record.getId())) {
+    /** Terminal decision taken from within the worker thread (handler has stopped). */
+    private void workerConverge(TaskRecord record, TaskStatus terminal, FailureReason reason, String result) {
+        if (record.decideTerminal(terminal, reason)) {
+            log.info("task {} worker won terminal decision: {}", record.getId(), terminal);
+            settle(record, terminal, reason, result, false);
+        } else {
+            log.info("task {} handler stopped after losing terminal decision; final state {}",
+                    record.getId(), record.getStatus());
+        }
+    }
+
+    /**
+     * Winner-only convergence: wait for the interrupted worker if needed, release
+     * permits, then publish the terminal status while the counters move. Terminal
+     * visibility therefore implies full stop + released resources.
+     */
+    private void settle(TaskRecord record, TaskStatus terminal, FailureReason reason,
+                        String result, boolean awaitWorker) {
+        if (awaitWorker) {
+            try {
+                record.awaitWorkerDone();
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        snapshotLock.lock();
+        try {
+            boolean wasRunning;
+            synchronized (record) {
+                wasRunning = record.isStarted();
+            }
+            if (wasRunning) {
+                runningCount--;
+            } else {
+                queuedCount--;
+            }
+            SourceCounters counters = sourceCounters.get(record.getSource());
+            if (counters != null) {
+                if (wasRunning) {
+                    counters.running--;
+                } else {
+                    counters.queued--;
+                }
+                if (counters.running == 0 && counters.queued == 0) {
+                    sourceCounters.remove(record.getSource());
+                }
+            }
+
             Semaphore sourceSemaphore = sourcePermits.get(record.getSource());
             if (sourceSemaphore != null) {
                 sourceSemaphore.release();
             }
             globalPermits.release();
-            log.debug("task {} resources released", record.getId());
+
+            synchronized (record) {
+                record.publishTerminal(terminal, reason, result);
+            }
+            log.info("task {} converged: status={} reason={} (worker stopped, permits released)",
+                    record.getId(), terminal, reason);
+        } finally {
+            snapshotLock.unlock();
         }
     }
 
@@ -259,5 +370,11 @@ public class DefaultTaskGovernor implements TaskGovernor {
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /** Mutable per-source occupancy; accessed only under {@link #snapshotLock}. */
+    private static final class SourceCounters {
+        private int running;
+        private int queued;
     }
 }

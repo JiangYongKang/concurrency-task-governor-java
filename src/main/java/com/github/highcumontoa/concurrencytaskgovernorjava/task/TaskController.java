@@ -17,7 +17,12 @@ import org.springframework.web.bind.annotation.RestController;
  *       400 invalid input, 429 capacity/source-limit rejection</li>
  *   <li>{@code GET /api/tasks/{id}} — 200 task view, 404 unknown id</li>
  *   <li>{@code POST /api/tasks/{id}/cancel} — 200 task view after cancel attempt,
+ *       404 unknown id. A returned terminal status means full convergence: the
+ *       handler stopped and all occupancy was released already</li>
+ *   <li>{@code GET /api/tasks/{id}/history} — 200 ordered lifecycle events,
  *       404 unknown id</li>
+ *   <li>{@code GET /api/snapshot} — 200 whole-service occupancy (running /
+ *       queued / total, per-source breakdown); pure read, never runs a task</li>
  * </ul>
  */
 @RestController
@@ -53,6 +58,13 @@ public class TaskController {
     public ResponseEntity<TaskView> cancel(@PathVariable String id) {
         return governor.cancel(id)
                 .map(record -> ResponseEntity.ok(TaskView.of(record)))
+                .orElseGet(() -> ResponseEntity.notFound().build());
+    }
+
+    @GetMapping("/{id}/history")
+    public ResponseEntity<java.util.List<TaskEvent>> history(@PathVariable String id) {
+        return governor.findById(id)
+                .map(record -> ResponseEntity.ok(governor.history(record.getId())))
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
