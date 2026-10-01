@@ -13,7 +13,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -37,6 +36,22 @@ import org.springframework.stereotype.Component;
  * resolve to exactly one conclusion. Permits are released exactly once because
  * finalization itself happens exactly once.
  *
+ * <p><b>Snapshot consistency.</b> All occupancy counters live in a single
+ * {@link OccupancyLedger} whose every mutation and every read takes one monitor.
+ * {@link #snapshot()} is therefore one linearizable point: running + queued,
+ * the in-flight total and the per-source breakdown are always drawn from the
+ * same state and can never tear (no negative queued counts, no source/total
+ * mismatch). {@code snapshot()} only reads: it never runs a task, never changes
+ * task state and never acquires an admission permit.
+ *
+ * <p><b>Atomic admission.</b> The duplicate-check &rarr; capacity/source check
+ * &rarr; register sequence for one idempotency key runs under a per-key lock, so
+ * concurrent same-key submits are a strict total order: exactly one wins as
+ * ACCEPTED and every loser observes it as DUPLICATE instead of racing past the
+ * lookup and being misreported as a capacity rejection. Counters move +1 once
+ * on acceptance and -1 once at finalization, so occupancy is conserved and
+ * every accepted task converges the counters back to exactly zero.
+ *
  * <p>Occupancy counters are authoritative for {@link #snapshot()} and are kept
  * consistent with permit holdings: +1 on acceptance, -1 at finalization while
  * holding the record monitor.
@@ -54,11 +69,11 @@ public class DefaultTaskGovernor implements TaskGovernor {
     private final Map<String, TaskRecord> tasksById = new ConcurrentHashMap<>();
     private final Map<String, String> idByIdempotencyKey = new ConcurrentHashMap<>();
     private final Map<String, Semaphore> sourcePermits = new ConcurrentHashMap<>();
-    private final Map<String, int[]> sourceCounters = new ConcurrentHashMap<>();
+    /** One admission lock per idempotency key, serializing duplicate-check -&gt; accept -&gt; register. */
+    private final Map<String, Object> keyLocks = new ConcurrentHashMap<>();
+    private final OccupancyLedger ledger = new OccupancyLedger();
 
     private final Semaphore globalPermits;
-    private final AtomicInteger runningTotal = new AtomicInteger();
-    private final AtomicInteger inFlightTotal = new AtomicInteger();
 
     private final ExecutorService workers;
     private final ScheduledExecutorService scheduler;
@@ -94,70 +109,60 @@ public class DefaultTaskGovernor implements TaskGovernor {
             return SubmissionResult.rejected(SubmissionOutcome.REJECTED_INVALID, validationError);
         }
 
-        String existingId = idByIdempotencyKey.get(request.idempotencyKey());
-        if (existingId != null) {
-            TaskRecord existing = resolveExisting(existingId);
-            if (existing != null) {
-                return SubmissionResult.duplicate(existing);
+        TaskRecord acceptedRecord;
+        long timeoutMs;
+        // Serialize the whole duplicate-check -> capacity check -> register
+        // sequence per idempotency key. Without this, concurrent same-key
+        // submits could all pass the initial lookup, each grab capacity, and
+        // only discover the collision at putIfAbsent — which misclassified the
+        // losers as capacity rejections and churned occupancy +1/-1 under the
+        // snapshot observer. A loser now always observes the winner (or a
+        // capacity/source rejection, with the same precedence as before).
+        Object keyLock = keyLocks.computeIfAbsent(request.idempotencyKey(), key -> new Object());
+        synchronized (keyLock) {
+            String existingId = idByIdempotencyKey.get(request.idempotencyKey());
+            if (existingId != null) {
+                // The winner registers in tasksById before the key map, so the
+                // record is already published when a racing loser reaches here.
+                TaskRecord existing = tasksById.get(existingId);
+                if (existing != null) {
+                    return SubmissionResult.duplicate(existing);
+                }
             }
-        }
 
-        if (!globalPermits.tryAcquire()) {
-            return SubmissionResult.rejected(SubmissionOutcome.REJECTED_CAPACITY,
-                    "global capacity exhausted (running + queued); retry later");
-        }
-        Semaphore sourceSemaphore = sourcePermits.computeIfAbsent(request.source(),
-                key -> new Semaphore(properties.perSourceMaxInFlight(), true));
-        if (!sourceSemaphore.tryAcquire()) {
-            globalPermits.release();
-            return SubmissionResult.rejected(SubmissionOutcome.REJECTED_SOURCE_LIMIT,
-                    "source '" + request.source() + "' exceeded its in-flight limit; retry later");
-        }
+            if (!globalPermits.tryAcquire()) {
+                return SubmissionResult.rejected(SubmissionOutcome.REJECTED_CAPACITY,
+                        "global capacity exhausted (running + queued); retry later");
+            }
+            Semaphore sourceSemaphore = sourcePermits.computeIfAbsent(request.source(),
+                    key -> new Semaphore(properties.perSourceMaxInFlight(), true));
+            if (!sourceSemaphore.tryAcquire()) {
+                globalPermits.release();
+                return SubmissionResult.rejected(SubmissionOutcome.REJECTED_SOURCE_LIMIT,
+                        "source '" + request.source() + "' exceeded its in-flight limit; retry later");
+            }
 
-        long timeoutMs = request.timeoutMs() != null ? request.timeoutMs() : properties.defaultTimeoutMs();
-        Instant now = Instant.now();
-        TaskRecord record = new TaskRecord(UUID.randomUUID().toString(), request.idempotencyKey(),
-                request.source(), request.type(), request.payload(), now, now.plusMillis(timeoutMs));
+            timeoutMs = request.timeoutMs() != null ? request.timeoutMs() : properties.defaultTimeoutMs();
+            Instant now = Instant.now();
+            TaskRecord record = new TaskRecord(UUID.randomUUID().toString(), request.idempotencyKey(),
+                    request.source(), request.type(), request.payload(), now, now.plusMillis(timeoutMs));
 
-        // Account for the permits while they are held and before the task is
-        // published, so a snapshot can never show an accepted task with no
-        // occupancy; roll it back if the idempotency race is lost.
-        inFlightTotal.incrementAndGet();
-        sourceCounters.computeIfAbsent(request.source(), key -> new int[2]);
-        bumpSource(request.source(), 0, 1);
-
-        String racedId = idByIdempotencyKey.putIfAbsent(request.idempotencyKey(), record.getId());
-        if (racedId != null) {
-            bumpSource(request.source(), 0, -1);
-            inFlightTotal.decrementAndGet();
-            sourceSemaphore.release();
-            globalPermits.release();
-            TaskRecord raced = resolveExisting(racedId);
-            return SubmissionResult.duplicate(raced != null ? raced : record);
+            // Publish the record and the idempotency mapping while still holding
+            // the admission lock; account first so an accepted task is never
+            // visible without its occupancy.
+            ledger.acceptQueued(request.source());
+            tasksById.put(record.getId(), record);
+            idByIdempotencyKey.put(request.idempotencyKey(), record.getId());
+            acceptedRecord = record;
         }
-        tasksById.put(record.getId(), record);
 
         log.info("task {} accepted: source={} type={} deadline={}",
-                record.getId(), record.getSource(), record.getType(), record.getDeadline());
+                acceptedRecord.getId(), acceptedRecord.getSource(),
+                acceptedRecord.getType(), acceptedRecord.getDeadline());
 
-        scheduler.schedule(() -> onDeadline(record.getId()), timeoutMs, TimeUnit.MILLISECONDS);
-        workers.execute(() -> execute(record));
-        return SubmissionResult.accepted(record);
-    }
-
-    /** Resolve a task by id, briefly covering the publish window of a racing winner. */
-    private TaskRecord resolveExisting(String id) {
-        TaskRecord existing = tasksById.get(id);
-        for (int i = 0; existing == null && i < 100; i++) {
-            try {
-                Thread.sleep(1);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-            existing = tasksById.get(id);
-        }
-        return existing;
+        scheduler.schedule(() -> onDeadline(acceptedRecord.getId()), timeoutMs, TimeUnit.MILLISECONDS);
+        workers.execute(() -> execute(acceptedRecord));
+        return SubmissionResult.accepted(acceptedRecord);
     }
 
     @Override
@@ -180,31 +185,24 @@ public class DefaultTaskGovernor implements TaskGovernor {
 
     @Override
     public GovernorSnapshot snapshot() {
-        int running = runningTotal.get();
-        int inFlight = inFlightTotal.get();
         int capacity = properties.maxConcurrency() + properties.maxQueueSize();
         Instant now = Instant.now();
 
-        List<GovernorSnapshot.SourceSnapshot> sourceViews = new ArrayList<>();
-        for (Map.Entry<String, int[]> entry : sourceCounters.entrySet()) {
-            int[] counters = entry.getValue();
-            int srcRunning;
-            int srcInFlight;
-            synchronized (counters) {
-                srcRunning = counters[0];
-                srcInFlight = counters[1];
-            }
-            if (srcInFlight == 0) {
-                continue;
-            }
-            int limit = properties.perSourceMaxInFlight();
-            Semaphore semaphore = sourcePermits.get(entry.getKey());
+        // One linearizable read: totals and the per-source breakdown can never
+        // disagree, because the ledger captures them in a single locked step.
+        OccupancyLedger.View view = ledger.snapshot();
+        int limit = properties.perSourceMaxInFlight();
+        List<GovernorSnapshot.SourceSnapshot> sourceViews = new ArrayList<>(view.sources().size());
+        for (OccupancyLedger.View.SourceView src : view.sources()) {
+            // availablePermits() is an independent, read-only gauge; it is not
+            // part of the occupancy invariants (a released permit may lag the
+            // counter decrement by the few instructions between them).
+            Semaphore semaphore = sourcePermits.get(src.source());
             int available = semaphore != null ? semaphore.availablePermits() : limit;
             sourceViews.add(new GovernorSnapshot.SourceSnapshot(
-                    entry.getKey(), srcRunning, srcInFlight - srcRunning, srcInFlight, limit, available));
+                    src.source(), src.running(), src.queued(), src.inFlight(), limit, available));
         }
-        sourceViews.sort(java.util.Comparator.comparing(GovernorSnapshot.SourceSnapshot::source));
-        return new GovernorSnapshot(now, running, inFlight - running, inFlight,
+        return new GovernorSnapshot(now, view.running(), view.queued(), view.inFlight(),
                 capacity, globalPermits.availablePermits(), List.copyOf(sourceViews));
     }
 
@@ -243,10 +241,7 @@ public class DefaultTaskGovernor implements TaskGovernor {
 
     private void execute(TaskRecord record) {
         String taskId = record.getId();
-        if (!record.beginRun(() -> {
-            runningTotal.incrementAndGet();
-            bumpSource(record.getSource(), 1, 0);
-        })) {
+        if (!record.beginRun(() -> ledger.beginRunning(record.getSource()))) {
             // Claimed (and finalized) while queued; handler must never run.
             Thread.interrupted();
             log.info("task {} skipped execution, already terminal: {}", taskId, record.getStatus());
@@ -299,17 +294,14 @@ public class DefaultTaskGovernor implements TaskGovernor {
 
     /**
      * Cleanup action executed inside the record monitor, immediately before the
-     * terminal status is published. Decrements counters then releases permits,
+     * terminal status is published. Decrements the ledger then releases permits,
      * so observed termination always matches released occupancy.
      */
     private Runnable releaseResources(TaskRecord record) {
         return () -> {
             String source = record.getSource();
-            decrementSource(source, record.getStartedAt() != null);
-            inFlightTotal.decrementAndGet();
-            if (record.getStartedAt() != null) {
-                runningTotal.decrementAndGet();
-            }
+            boolean wasRunning = record.getStartedAt() != null;
+            ledger.release(source, wasRunning);
             Semaphore sourceSemaphore = sourcePermits.get(source);
             if (sourceSemaphore != null) {
                 sourceSemaphore.release();
@@ -317,27 +309,6 @@ public class DefaultTaskGovernor implements TaskGovernor {
             globalPermits.release();
             log.debug("task {} resources released", record.getId());
         };
-    }
-
-    private void bumpSource(String source, int runningDelta, int inFlightDelta) {
-        int[] counters = sourceCounters.get(source);
-        synchronized (counters) {
-            counters[0] += runningDelta;
-            counters[1] += inFlightDelta;
-        }
-    }
-
-    private void decrementSource(String source, boolean wasRunning) {
-        int[] counters = sourceCounters.get(source);
-        if (counters == null) {
-            return;
-        }
-        synchronized (counters) {
-            if (wasRunning) {
-                counters[0]--;
-            }
-            counters[1]--;
-        }
     }
 
     private static void awaitConvergedQuietly(TaskRecord record) {
